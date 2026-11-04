@@ -2,6 +2,7 @@
 name: Java Spring Boot CI
 
 on:
+  workflow_dispatch:
   #push:
     #branches:
      # - main
