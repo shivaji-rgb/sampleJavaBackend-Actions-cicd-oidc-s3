@@ -1,0 +1,206 @@
+
+name: Java Spring Boot CI-CD
+
+on:
+  workflow_dispatch:
+  # push:
+  #   branches:
+  #     - main
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build-and-deploy:
+    name: Build and Deploy to Private EC2
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+          cache-dependency-path: backend-service-1/pom.xml
+
+      - name: Build Spring Boot Application
+        working-directory: backend-service-1
+        run: mvn clean verify
+
+      - name: Find Application JAR
+        id: jar
+        shell: bash
+        run: |
+          mapfile -t JARS < <(
+            find backend-service-1/target \
+              -maxdepth 1 -type f -name '*.jar' \
+              ! -name '*.original' \
+              ! -name '*-sources.jar' \
+              ! -name '*-javadoc.jar'
+          )
+
+          if [ "${#JARS[@]}" -ne 1 ]; then
+            echo "Expected exactly one application JAR, found ${#JARS[@]}"
+            printf '%s\n' "${JARS[@]}"
+            exit 1
+          fi
+
+          echo "jar_path=${JARS[0]}" >> "$GITHUB_OUTPUT"
+      
+      - name: Debug GitHub OIDC Claims
+        run: |
+          python3 - <<'PY'
+          import os
+          import json
+          import urllib.request
+          import base64
+
+          url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]
+          url += "&audience=sts.amazonaws.com"
+
+          request = urllib.request.Request(
+              url,
+              headers={
+                  "Authorization": "bearer " +
+                  os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]
+              }
+          )
+
+          with urllib.request.urlopen(request) as response:
+              token = json.loads(response.read())["value"]
+
+          payload = token.split(".")[1]
+          payload += "=" * (-len(payload) % 4)
+
+          claims = json.loads(
+              base64.urlsafe_b64decode(payload)
+          )
+
+          print("AUD:", claims.get("aud"))
+          print("SUB:", claims.get("sub"))
+          PY
+
+      
+      - name: Configure AWS Credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::739399618725:role/github-role-oidc
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Upload JAR to S3
+        env:
+          JAR_PATH: ${{ steps.jar.outputs.jar_path }}
+        run: |
+          aws s3 cp "$JAR_PATH" \
+            "s3://s3-java-jars/releases/${GITHUB_SHA}/app.jar"
+
+      - name: Deploy Application using SSM
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REMOTE_SCRIPT=$(cat <<EOF
+          set -euo pipefail
+
+          echo "Installing Java 17 and AWS CLI"
+          dnf install -y java-17-amazon-corretto-headless awscli-2
+
+          echo "Creating application user"
+          id backend-service-1 >/dev/null 2>&1 || \
+            useradd --system --no-create-home --shell /sbin/nologin backend-service-1
+
+          mkdir -p /opt/backend-service-1
+
+          echo "Downloading application JAR"
+          aws s3 cp \
+            "s3://s3-java-jars/releases/${GITHUB_SHA}/app.jar" \
+            /tmp/backend-service-1.jar \
+            --region "${{ vars.AWS_REGION }}"
+
+          install -o backend-service-1 -g backend-service-1 \
+            -m 0644 /tmp/backend-service-1.jar \
+            /opt/backend-service-1/app.jar
+
+          echo "Creating systemd service"
+          cat > /etc/systemd/system/backend-service-1.service <<'UNIT'
+          [Unit]
+          Description=Backend Service 1 - Spring Boot Application
+          After=network.target
+
+          [Service]
+          User=backend-service-1
+          WorkingDirectory=/opt/backend-service-1
+          ExecStart=/usr/bin/java -jar /opt/backend-service-1/app.jar
+          Restart=always
+          RestartSec=10
+          SuccessExitStatus=143
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+
+          systemctl daemon-reload
+          systemctl enable backend-service-1
+          systemctl restart backend-service-1
+
+          echo "Checking service status"
+          systemctl is-active --quiet backend-service-1
+          systemctl status backend-service-1 --no-pager
+          EOF
+          )
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "i-043a5d20eb043c321" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy backend-service-1 from GitHub Actions" \
+            --parameters "$(jq -n --arg cmd "$REMOTE_SCRIPT" \
+              '{commands: [$cmd]}')" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM Command ID: $COMMAND_ID"
+
+          STATUS="Pending"
+
+          for i in $(seq 1 60); do
+            STATUS=$(aws ssm list-command-invocations \
+              --command-id "$COMMAND_ID" \
+              --details \
+              --query "CommandInvocations[0].Status" \
+              --output text 2>/dev/null || echo "Pending")
+
+            echo "Deployment status: $STATUS"
+
+            case "$STATUS" in
+              Success)
+                echo "Deployment completed successfully"
+                break
+                ;;
+              Failed|Cancelled|TimedOut|Cancelling)
+                echo "Deployment failed"
+                break
+                ;;
+            esac
+
+            sleep 10
+          done
+
+          if [ "$STATUS" != "Success" ]; then
+            aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "i-043a5d20eb043c321" \
+              --query '{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}' \
+              --output json || true
+            exit 1
+          fi
+
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "i-043a5d20eb043c321" \
+            --query 'StandardOutputContent' \
+            --output text
