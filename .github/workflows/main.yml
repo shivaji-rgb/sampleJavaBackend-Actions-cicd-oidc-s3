@@ -1,0 +1,65 @@
+
+name: Java Spring Boot CI
+
+# on:
+#   push:
+#     branches:
+#       - main
+
+#   pull_request:
+#     branches:
+#       - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+          cache-dependency-path: freshdrop-backend/pom.xml
+
+      - name: Install Maven
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y maven
+
+      - name: Check Java and Maven
+        run: |
+          java -version
+          mvn -version
+
+      - name: Clean
+        working-directory: freshdrop-backend
+        run: mvn clean
+
+      - name: Compile
+        working-directory: freshdrop-backend
+        run: mvn compile
+
+      - name: Run Tests
+        working-directory: freshdrop-backend
+        run: mvn test
+
+      - name: Package Application
+        working-directory: freshdrop-backend
+        run: mvn package -DskipTests
+
+      - name: Upload JAR Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: freshdrop-application
+          path: freshdrop-backend/target/*.jar
+          if-no-files-found: error
+          retention-days: 7
