@@ -29,7 +29,7 @@ jobs:
           distribution: temurin
           java-version: '17'
           cache: maven
-          cache-dependency-path: freshdrop-backend/pom.xml
+          cache-dependency-path: backend-service-1/pom.xml
 
       - name: Install Maven
         run: |
@@ -42,25 +42,25 @@ jobs:
           mvn -version
 
       - name: Clean
-        working-directory: freshdrop-backend
+        working-directory: backend-service-1
         run: mvn clean
 
       - name: Compile
-        working-directory: freshdrop-backend
+        working-directory: backend-service-1
         run: mvn compile
 
       - name: Run Tests
-        working-directory: freshdrop-backend
+        working-directory: backend-service-1
         run: mvn test
 
       - name: Package Application
-        working-directory: freshdrop-backend
+        working-directory: backend-service-1
         run: mvn package -DskipTests
 
       - name: Upload JAR Artifact
         uses: actions/upload-artifact@v4
         with:
           name: freshdrop-application
-          path: freshdrop-backend/target/*.jar
+          path: backend-service-1/target/*.jar
           if-no-files-found: error
           retention-days: 7
